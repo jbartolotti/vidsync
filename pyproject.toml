@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vidsync"
+version = "0.1.0"
+description = "Desktop app for synchronizing video playback with timecourse data"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "jbartolotti" }
+]
+license = { text = "MIT" }
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyqtgraph",
+  "PyQt5",
+  "python-vlc",
+  "opencv-python"
+]
+
+[project.scripts]
+vidsync = "app:main"
+
+[tool.setuptools]
+py-modules = ["app"]
