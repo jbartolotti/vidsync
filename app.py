@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 from typing import Optional
@@ -12,60 +11,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     cv2 = None
 
-
-def _load_vlc_module():
-    """Import python-vlc and make sure the native VLC runtime can be found."""
-    candidate_dirs = []
-    for env_name in ("VLC_DIR", "VLC_HOME"):
-        value = os.environ.get(env_name)
-        if value:
-            candidate_dirs.append(value)
-
-    for base in (
-        r"C:\Program Files\VideoLAN\VLC",
-        r"C:\Program Files (x86)\VideoLAN\VLC",
-        os.path.join(os.environ.get("ProgramFiles", ""), "VideoLAN", "VLC"),
-    ):
-        if base:
-            candidate_dirs.append(base)
-
-    seen = set()
-    unique_dirs = []
-    for directory in candidate_dirs:
-        normalized = os.path.normcase(os.path.abspath(directory))
-        if normalized not in seen:
-            seen.add(normalized)
-            unique_dirs.append(directory)
-
-    original_cwd = os.getcwd()
-    try:
-        for directory in unique_dirs:
-            if not directory or not os.path.isdir(directory):
-                continue
-            dll_path = os.path.join(directory, "libvlc.dll")
-            if os.path.isfile(dll_path):
-                os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
-                os.environ["VLC_PLUGIN_PATH"] = os.path.join(directory, "plugins")
-                os.chdir(directory)
-                try:
-                    import vlc as vlc_mod
-                    return vlc_mod, None
-                except Exception as exc:
-                    return None, exc
-
-        try:
-            import vlc as vlc_mod
-            return vlc_mod, None
-        except Exception as exc:
-            return None, exc
-    finally:
-        os.chdir(original_cwd)
-
-
-vlc, vlc_error = _load_vlc_module()
-
 try:
-    from PyQt5.QtCore import Qt, QTimer
+    from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
     from PyQt5.QtGui import QColor, QImage, QPixmap
     from PyQt5.QtWidgets import (
         QApplication,
@@ -79,13 +26,11 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
-        QSlider,
-        QStackedWidget,
         QVBoxLayout,
         QWidget,
     )
 except ImportError:
-    from PyQt6.QtCore import Qt, QTimer
+    from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QColor, QImage, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
@@ -99,97 +44,228 @@ except ImportError:
         QMainWindow,
         QMessageBox,
         QPushButton,
-        QSlider,
-        QStackedWidget,
         QVBoxLayout,
         QWidget,
     )
+
+try:
+    from ffpyplayer.player import MediaPlayer
+except ImportError:  # pragma: no cover - optional dependency
+    MediaPlayer = None
+
+
+class VideoPlayer(QObject):
+    """ffpyplayer-backed playback that uses ffpyplayer for audio and timing."""
+
+    frame_ready = pyqtSignal(object, float)
+    playback_finished = pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._player = None
+        self._path: Optional[str] = None
+        self._paused = True
+        self._duration_seconds = None
+        self._timer = None
+        self._last_pts = None
+        self._last_image = None
+
+    def load_video(self, path: str) -> None:
+        if MediaPlayer is None:
+            raise RuntimeError("ffpyplayer is not installed. Install ffpyplayer to use this backend.")
+
+        self.pause()
+        self._close_player()
+        self._path = path
+        self._player = MediaPlayer(path, ff_opts={"framedrop": True, "sync": "audio"})
+        self._paused = True
+        self._duration_seconds = None
+        self._last_pts = None
+        self._last_image = None
+        if self._player is not None:
+            try:
+                metadata = self._player.get_metadata()
+            except Exception:
+                metadata = {}
+            if isinstance(metadata, dict):
+                duration = metadata.get("duration")
+                if duration is not None:
+                    try:
+                        self._duration_seconds = float(duration)
+                    except (TypeError, ValueError):
+                        self._duration_seconds = None
+        if self._player is not None:
+            self._player.set_pause(True)
+
+    def _close_player(self) -> None:
+        if self._player is not None:
+            try:
+                self._player.close_player()
+            except Exception:
+                pass
+        self._player = None
+
+    def set_timer(self, timer) -> None:
+        self._timer = timer
+
+    def play(self) -> None:
+        if self._player is None:
+            return
+        self._paused = False
+        self._player.set_pause(False)
+        if self._timer is not None and not self._timer.isActive():
+            self._timer.start(5)
+
+    def pause(self) -> None:
+        if self._player is not None:
+            self._player.set_pause(True)
+        self._paused = True
+        if self._timer is not None:
+            self._timer.stop()
+
+    def seek(self, time_seconds: float) -> None:
+        if self._player is None:
+            return
+        try:
+            self._player.seek(float(time_seconds), relative=False)
+        except Exception:
+            pass
+        self._last_pts = None
+        self._player.set_pause(self._paused)
+
+    def update_frame(self) -> None:
+        if self._player is None or self._paused:
+            return
+
+        try:
+            frame, val = self._player.get_frame()
+        except Exception:
+            return
+
+        if val == "eof":
+            self.pause()
+            self.playback_finished.emit()
+            return
+        if frame is None:
+            return
+
+        # ✅ IMPORTANT: respect timing
+        if isinstance(val, (int, float)) and val > 0:
+            # Adjust timer interval based on ffpyplayer timing
+            if self._timer is not None:
+                self._timer.start(int(val * 1000))
+
+        img, pts = frame
+        if img is None:
+            return
+        try:
+            w, h = img.get_size()
+            pix_fmt = img.get_pixel_format()
+
+            # Convert to RGB24 bytes
+            raw = img.to_bytearray()[0]
+            frame_array = np.frombuffer(raw, dtype=np.uint8)
+
+            # reshape (h, w, 3)
+            frame_array = frame_array.reshape((h, w, 3))
+
+        except Exception as e:
+            print("CONVERSION ERROR:", e)
+            return
+
+        if frame_array is None:
+            return
+        if frame_array.ndim == 2:
+            frame_array = np.repeat(frame_array[:, :, None], 3, axis=2)
+        elif frame_array.ndim == 3 and frame_array.shape[2] == 4:
+            frame_array = frame_array[:, :, :3]
+        elif frame_array.ndim == 3 and frame_array.shape[2] == 1:
+            frame_array = np.repeat(frame_array, 3, axis=2)
+
+        if frame_array.dtype != np.uint8:
+            frame_array = frame_array.astype(np.uint8)
+        frame_array = np.ascontiguousarray(frame_array)
+        height, width = frame_array.shape[:2]
+        if width == 0 or height == 0:
+            return
+
+        bytes_per_line = width * 3
+        image_bytes = frame_array.tobytes()
+        qimage = QImage(image_bytes, width, height, bytes_per_line, QImage.Format_RGB888)
+        qimage = qimage.copy()
+        self._last_image = qimage
+
+        pts_value = float(pts) if pts is not None else (self._last_pts if self._last_pts is not None else 0.0)
+        self._last_pts = pts_value
+        self.frame_ready.emit(qimage, pts_value)
+
+    def get_frame_interval_ms(self) -> int:
+        return 5
+
+    def is_paused(self) -> bool:
+        return self._paused
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Video-Timecourse Sync")
+        self.setWindowTitle("ffpyplayer Video Sync")
         self.resize(1400, 800)
 
-        self.player = None
-        self.vlc_instance = None
-        self.vlc_media = None
-        self.vlc_error = vlc_error
-        self.video_widget = QWidget(self)
-        self.video_widget.setAttribute(Qt.WA_NativeWindow, True)
-        self.video_widget.setMinimumSize(320, 240)
-        self.video_widget.setStyleSheet("background-color: black;")
+        self.video_player = VideoPlayer(self)
+        self.video_player.frame_ready.connect(self._on_frame_ready)
+        self.video_player.playback_finished.connect(self._on_playback_finished)
+
         self.video_frame_label = QLabel("No video loaded")
         self.video_frame_label.setAlignment(Qt.AlignCenter)
         self.video_frame_label.setStyleSheet("background-color: black; color: white;")
-        self.video_stack = QStackedWidget(self)
-        self.video_stack.addWidget(self.video_widget)
-        self.video_stack.addWidget(self.video_frame_label)
-        self.video_stack.setCurrentWidget(self.video_frame_label)
+        self.video_frame_label.setMinimumSize(640, 360)
 
-        self.video_capture = None
         self.video_timer = QTimer(self)
-        self.video_timer.timeout.connect(self._advance_opencv_frame)
+        self.video_timer.timeout.connect(self.video_player.update_frame)
         self.video_timer.setTimerType(Qt.PreciseTimer)
-        self.position_timer = QTimer(self)
-        self.position_timer.timeout.connect(self._update_vlc_position)
-        self.position_timer.setInterval(100)
+        self.video_timer.setInterval(5)
+        self.video_timer.setSingleShot(False)
+        self.video_player.set_timer(self.video_timer)
+
         self.video_backend = "none"
+        self.video_path: Optional[str] = None
+        self.video_duration_seconds = None
         self.video_fps = 30.0
         self.opencv_position_ms = 0
         self._opencv_frame_needs_seek = True
-        self.video_duration_ms = 0
-        self.video_path: Optional[str] = None
-
-        if vlc is not None:
-            try:
-                self.vlc_instance = vlc.Instance()
-                self.player = self.vlc_instance.media_player_new()
-                self.video_backend = "vlc"
-            except Exception as exc:
-                self.player = None
-                self.video_backend = "none"
-                self.vlc_error = exc
+        self.video_capture = None
 
         self.data_frame: Optional[pd.DataFrame] = None
         self.processed_frame: Optional[pd.DataFrame] = None
         self.categorical_columns = []
         self.category_controls = []
-        self.current_groupings = {}
-        self.preferences_path = os.path.join(os.path.dirname(__file__), "preferences.json")
+        self.legend_item = None
+        self._legend_visible = True
+        self.params_group = None
+        self.params_toggle_button = None
 
         self._build_ui()
-        self._load_preferences_from_file(self.preferences_path, quiet=True)
 
     def _build_ui(self) -> None:
-        central_widget = QWidget(self)
-        self.setCentralWidget(central_widget)
+        central = QWidget(self)
+        self.setCentralWidget(central)
 
-        main_layout = QHBoxLayout(central_widget)
+        main_layout = QHBoxLayout(central)
 
         left_panel = QWidget(self)
         left_layout = QVBoxLayout(left_panel)
 
-        self.video_controls = QHBoxLayout()
+        video_controls = QHBoxLayout()
         self.load_video_button = QPushButton("Load Video")
         self.load_video_button.clicked.connect(self._load_video)
         self.play_pause_button = QPushButton("Play")
         self.play_pause_button.clicked.connect(self._toggle_play_pause)
-        self.video_controls.addWidget(self.load_video_button)
-        self.video_controls.addWidget(self.play_pause_button)
+        video_controls.addWidget(self.load_video_button)
+        video_controls.addWidget(self.play_pause_button)
 
-        self.seek_slider = QSlider(Qt.Horizontal)
-        self.seek_slider.setRange(0, 0)
-        self.seek_slider.sliderMoved.connect(self._on_seek_slider_moved)
-
-        self.backend_status_label = QLabel("Backend: none")
-        self.backend_status_label.setStyleSheet("font-size: 10pt; color: #555;")
-
-        left_layout.addLayout(self.video_controls)
-        left_layout.addWidget(self.video_stack, stretch=1)
-        left_layout.addWidget(self.backend_status_label)
-        left_layout.addWidget(self.seek_slider)
+        left_layout.addLayout(video_controls)
+        left_layout.addWidget(self.video_frame_label, stretch=1)
 
         right_panel = QWidget(self)
         right_layout = QVBoxLayout(right_panel)
@@ -197,33 +273,43 @@ class MainWindow(QMainWindow):
         self.plot_widget = pg.PlotWidget(title="Timecourse")
         self.plot_widget.setLabel("bottom", "Time (s)")
         self.plot_widget.setLabel("left", "Value")
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setMouseEnabled(x=True, y=True)
         self.plot_widget.setMenuEnabled(True)
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
 
         self.playhead = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("r", width=2))
         self.plot_widget.addItem(self.playhead)
 
+        self.legend_toggle_button = QPushButton("Hide legend")
+        self.legend_toggle_button.clicked.connect(self._toggle_legend_visibility)
+        legend_row = QHBoxLayout()
+        legend_row.addStretch()
+        legend_row.addWidget(self.legend_toggle_button)
+        right_layout.addLayout(legend_row)
+        self.legend_item = pg.LegendItem(offset=(10, 10))
+        self.legend_item.setParentItem(self.plot_widget.plotItem)
+        self.legend_item.hide()
         right_layout.addWidget(self.plot_widget, stretch=1)
 
-        control_group = QGroupBox("Controls")
-        control_layout = QVBoxLayout(control_group)
+        controls_group = QGroupBox("Controls")
+        controls_layout = QVBoxLayout(controls_group)
 
         file_row = QHBoxLayout()
         self.load_data_button = QPushButton("Load Data")
         self.load_data_button.clicked.connect(self._load_data)
-        self.load_preferences_button = QPushButton("Load Preferences")
-        self.load_preferences_button.clicked.connect(self._load_preferences)
-        self.save_preferences_button = QPushButton("Save Preferences")
-        self.save_preferences_button.clicked.connect(self._save_preferences)
         file_row.addWidget(self.load_data_button)
-        file_row.addWidget(self.load_preferences_button)
-        file_row.addWidget(self.save_preferences_button)
-        control_layout.addLayout(file_row)
+        controls_layout.addLayout(file_row)
 
-        params_group = QGroupBox("Parameters")
-        params_layout = QFormLayout(params_group)
+        self.params_toggle_button = QPushButton("Parameters")
+        self.params_toggle_button.setCheckable(True)
+        self.params_toggle_button.setChecked(False)
+        self.params_toggle_button.clicked.connect(self._toggle_parameters_visibility)
+        controls_layout.addWidget(self.params_toggle_button)
+
+        self.params_group = QGroupBox("Parameters")
+        self.params_group.setVisible(False)
+        params_layout = QFormLayout(self.params_group)
         self.tr_duration_spin = QDoubleSpinBox()
         self.tr_duration_spin.setRange(0.001, 1000.0)
         self.tr_duration_spin.setValue(2.0)
@@ -231,70 +317,53 @@ class MainWindow(QMainWindow):
         self.tr_duration_spin.valueChanged.connect(self._refresh_plot)
         self.time_offset_spin = QDoubleSpinBox()
         self.time_offset_spin.setRange(-100000.0, 100000.0)
-        self.time_offset_spin.setValue(0.0)
+        self.time_offset_spin.setValue(6.0)
         self.time_offset_spin.setDecimals(3)
         self.time_offset_spin.valueChanged.connect(self._refresh_plot)
         params_layout.addRow("TR duration (s)", self.tr_duration_spin)
         params_layout.addRow("Time offset (s)", self.time_offset_spin)
-        control_layout.addWidget(params_group)
+        controls_layout.addWidget(self.params_group)
 
         self.category_group = QGroupBox("Category Filters")
         self.category_layout = QVBoxLayout(self.category_group)
-        control_layout.addWidget(self.category_group)
+        controls_layout.addWidget(self.category_group)
 
-        right_layout.addWidget(control_group)
+        right_layout.addWidget(controls_group)
         main_layout.addWidget(left_panel, stretch=1)
         main_layout.addWidget(right_panel, stretch=1)
 
     def _load_video(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open Video", os.path.expanduser("~"), "Video Files (*.mp4 *.mov *.avi *.mkv *.wmv *.webm)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Video",
+            os.path.expanduser("~"),
+            "Video Files (*.mp4 *.mov *.avi *.mkv *.wmv *.webm)",
+        )
         if not path:
             return
 
         self.video_path = path
         self._stop_opencv_video()
-        self._stop_vlc_video()
-        self.video_stack.setCurrentWidget(self.video_widget)
+        self.video_player.pause()
+        self.video_timer.stop()
+        self.video_backend = "ffpyplayer"
+        self._update_backend_status("ffpyplayer")
         self.video_frame_label.setText("Loading video...")
         self.play_pause_button.setText("Play")
-        self.seek_slider.setRange(0, 0)
-        self.video_timer.stop()
-        self.position_timer.stop()
 
-        if vlc is None or self.vlc_instance is None or self.player is None:
-            if cv2 is not None:
-                self._start_opencv_video(path)
-            else:
-                self._show_error(
-                    "VLC playback is not available. Install python-vlc and the VLC runtime, or ensure libvlc.dll is on your system.\n\n"
-                    f"Details: {self.vlc_error}"
-                )
-            return
-
-        self.video_backend = "vlc"
-        self.vlc_media = self.vlc_instance.media_new(path)
-        self.player.set_media(self.vlc_media)
-        self._attach_vlc_window()
-        self.position_timer.start()
-        self.play_pause_button.setText("Play")
-        self._update_backend_status("vlc")
-
-    def _attach_vlc_window(self) -> None:
-        if self.player is None:
-            return
         try:
-            self.player.set_hwnd(int(self.video_widget.winId()))
-        except Exception:
-            QTimer.singleShot(0, self._attach_vlc_window)
+            self.video_player.load_video(path)
+        except Exception as exc:
+            self._show_error(f"ffpyplayer could not open the video:\n{exc}")
+            self.video_backend = "none"
+            self._update_backend_status("none")
+            self.video_frame_label.setText("Video not loaded")
+            return
 
-    def _stop_vlc_video(self) -> None:
-        self.position_timer.stop()
-        if self.player is not None:
-            try:
-                self.player.stop()
-            except Exception:
-                pass
-        self.vlc_media = None
+        self.video_frame_label.setText("Video loaded")
+        self.play_pause_button.setText("Pause")
+        self.video_timer.stop()
+        self.video_player.play()
 
     def _start_opencv_video(self, path: str) -> None:
         if cv2 is None:
@@ -308,15 +377,24 @@ class MainWindow(QMainWindow):
 
         self.video_capture = capture
         self.video_backend = "opencv"
-        self.video_stack.setCurrentWidget(self.video_frame_label)
         self.video_frame_label.setText("Visual fallback (audio unavailable)")
         self.video_fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
         frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
-        self.video_duration_ms = int((frame_count / self.video_fps * 1000.0) if self.video_fps > 0 else 0)
-        self.seek_slider.setRange(0, max(self.video_duration_ms, 0))
+        self.video_duration_seconds = (frame_count / self.video_fps) if self.video_fps > 0 else 0.0
         self.opencv_position_ms = 0
         self._opencv_frame_needs_seek = True
         self._display_current_frame()
+        self.video_timer.stop()
+        self.video_timer.setSingleShot(False)
+        try:
+            self.video_timer.timeout.disconnect(self.video_player.update_frame)
+        except TypeError:
+            pass
+        try:
+            self.video_timer.timeout.disconnect(self._advance_opencv_frame)
+        except TypeError:
+            pass
+        self.video_timer.timeout.connect(self._advance_opencv_frame)
         self.video_timer.start(max(10, int(1000 / max(self.video_fps, 1))))
         self._update_backend_status("opencv")
 
@@ -325,15 +403,32 @@ class MainWindow(QMainWindow):
         if self.video_capture is not None:
             self.video_capture.release()
             self.video_capture = None
+        self.video_timer.stop()
+        try:
+            self.video_timer.timeout.disconnect(self._advance_opencv_frame)
+        except TypeError:
+            pass
+        try:
+            self.video_timer.timeout.disconnect(self.video_player.update_frame)
+        except TypeError:
+            pass
+        self.video_timer.timeout.connect(self.video_player.update_frame)
+        self.video_timer.setSingleShot(False)
 
     def _update_backend_status(self, backend: str) -> None:
         self.video_backend = backend
-        if backend == "vlc":
-            self.backend_status_label.setText("Backend: python-vlc")
-        elif backend == "opencv":
-            self.backend_status_label.setText("Backend: opencv")
-        else:
-            self.backend_status_label.setText("Backend: none")
+
+    def _on_frame_ready(self, image: QImage, pts: float) -> None:
+        pixmap = QPixmap.fromImage(image)
+        self.video_frame_label.setPixmap(
+            pixmap.scaled(self.video_frame_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        # Synchronize the plot cursor with the ffpyplayer presentation timestamp.
+        self.playhead.setValue(pts)
+
+    def _on_playback_finished(self) -> None:
+        self.play_pause_button.setText("Play")
+        self.video_timer.stop()
 
     def _display_current_frame(self) -> None:
         if self.video_capture is None:
@@ -357,35 +452,12 @@ class MainWindow(QMainWindow):
         if self.video_capture is None:
             return
         self.opencv_position_ms += int(1000 / max(self.video_fps, 1))
-        if self.video_duration_ms > 0 and self.opencv_position_ms >= self.video_duration_ms:
-            self.opencv_position_ms = self.video_duration_ms
+        if self.video_duration_seconds and self.opencv_position_ms >= int(self.video_duration_seconds * 1000.0):
+            self.opencv_position_ms = int(self.video_duration_seconds * 1000.0)
             self.video_timer.stop()
             self.play_pause_button.setText("Play")
         self._display_current_frame()
         self.playhead.setValue(self.opencv_position_ms / 1000.0)
-        self.seek_slider.blockSignals(True)
-        self.seek_slider.setValue(self.opencv_position_ms)
-        self.seek_slider.blockSignals(False)
-
-    def _update_vlc_position(self) -> None:
-        if self.video_backend != "vlc" or self.player is None:
-            return
-        length = self.player.get_length()
-        if length > 0:
-            self.seek_slider.setRange(0, int(length))
-        time_ms = self.player.get_time()
-        if time_ms >= 0:
-            self.playhead.setValue(time_ms / 1000.0)
-            self.seek_slider.blockSignals(True)
-            self.seek_slider.setValue(time_ms)
-            self.seek_slider.blockSignals(False)
-            self._on_position_changed(time_ms)
-
-    def _on_media_error(self, error) -> None:
-        if self.video_path:
-            self._start_opencv_video(self.video_path)
-            return
-        self._show_error("The selected video could not be opened by the current playback backend.")
 
     def _load_data(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open Timecourse Data", os.path.expanduser("~"), "Data Files (*.csv *.tsv *.txt)")
@@ -466,7 +538,6 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
         self.category_controls = []
-        self.current_groupings = {}
 
         if self.processed_frame is None:
             self.category_group.setVisible(False)
@@ -511,9 +582,13 @@ class MainWindow(QMainWindow):
         self.plot_widget.setLabel("bottom", "Time (s)")
         self.plot_widget.setLabel("left", "Value")
 
+        if self.legend_item is not None:
+            self.legend_item.clear()
+
         if df.empty:
             return
 
+        plotted_items = []
         if self.categorical_columns:
             grouping = df[self.categorical_columns].fillna("<NA>").astype(str).agg(lambda row: " | ".join(row), axis=1)
             unique_groups = grouping.unique()
@@ -530,12 +605,22 @@ class MainWindow(QMainWindow):
             for index, group_value in enumerate(unique_groups):
                 subset = df[grouping == group_value]
                 pen = pg.mkPen(color=palette[index % len(palette)], width=2)
-                self.plot_widget.plot(subset["__seconds__"].to_numpy(), subset["__value__"].to_numpy(), pen=pen, name=str(group_value))
+                curve = self.plot_widget.plot(subset["__seconds__"].to_numpy(), subset["__value__"].to_numpy(), pen=pen, name=str(group_value))
+                plotted_items.append((curve, str(group_value)))
         else:
-            self.plot_widget.plot(df["__seconds__"].to_numpy(), df["__value__"].to_numpy(), pen=pg.mkPen(color=QColor("#1f77b4"), width=2), name="value")
+            curve = self.plot_widget.plot(df["__seconds__"].to_numpy(), df["__value__"].to_numpy(), pen=pg.mkPen(color=QColor("#1f77b4"), width=2), name="value")
+            plotted_items.append((curve, "value"))
+
+        if self.legend_item is not None and plotted_items:
+            for curve, label in plotted_items:
+                self.legend_item.addItem(curve, label)
+            self.legend_item.setVisible(self._legend_visible)
+            self.legend_item.show()
+        elif self.legend_item is not None:
+            self.legend_item.hide()
 
     def _on_plot_clicked(self, event) -> None:
-        if self.processed_frame is None or self.player is None:
+        if self.processed_frame is None:
             return
         if not self.plot_widget.sceneBoundingRect().contains(event.scenePos()):
             return
@@ -548,35 +633,9 @@ class MainWindow(QMainWindow):
                 self._opencv_frame_needs_seek = True
                 self._display_current_frame()
                 self.playhead.setValue(self.opencv_position_ms / 1000.0)
-                self.seek_slider.blockSignals(True)
-                self.seek_slider.setValue(self.opencv_position_ms)
-                self.seek_slider.blockSignals(False)
-            else:
-                self.player.setPosition(int(x_value * 1000.0))
-
-    def _on_position_changed(self, position_ms: int) -> None:
-        if self.processed_frame is None:
-            return
-        seconds = position_ms / 1000.0
-        self.playhead.setValue(seconds)
-        self.seek_slider.blockSignals(True)
-        self.seek_slider.setValue(position_ms)
-        self.seek_slider.blockSignals(False)
-
-    def _on_duration_changed(self, duration_ms: int) -> None:
-        self.seek_slider.setRange(0, max(duration_ms, 0))
-
-    def _on_seek_slider_moved(self, value: int) -> None:
-        if self.video_backend == "opencv":
-            self.opencv_position_ms = value
-            self._opencv_frame_needs_seek = True
-            self._display_current_frame()
-            self.playhead.setValue(self.opencv_position_ms / 1000.0)
-            return
-        if self.video_backend == "vlc" and self.player is not None:
-            self.player.set_time(value)
-            self.playhead.setValue(value / 1000.0)
-            return
+            elif self.video_backend == "ffpyplayer":
+                self.video_player.seek(float(x_value))
+                self.playhead.setValue(float(x_value))
 
     def _toggle_play_pause(self) -> None:
         if self.video_backend == "opencv":
@@ -588,52 +647,27 @@ class MainWindow(QMainWindow):
                 self.play_pause_button.setText("Pause")
             return
 
-        if self.video_backend == "vlc" and self.player is not None:
-            if self.player.is_playing():
-                self.player.pause()
-                self.play_pause_button.setText("Play")
-            else:
-                self.player.play()
-                self.play_pause_button.setText("Pause")
+        if self.video_backend != "ffpyplayer":
             return
+        if self.video_player.is_paused():
+            self.video_player.play()
+            self.play_pause_button.setText("Pause")
+        else:
+            self.video_player.pause()
+            self.play_pause_button.setText("Play")
 
-    def _load_preferences(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open Preferences", os.path.expanduser("~"), "JSON Files (*.json)")
-        if path:
-            self._load_preferences_from_file(path)
+    def _toggle_legend_visibility(self) -> None:
+        self._legend_visible = not self._legend_visible
+        if self.legend_item is not None:
+            self.legend_item.setVisible(self._legend_visible)
+        self.legend_toggle_button.setText("Show legend" if not self._legend_visible else "Hide legend")
 
-    def _load_preferences_from_file(self, path: str, quiet: bool = False) -> None:
-        if not os.path.exists(path):
-            if not quiet:
-                self._show_error(f"Preferences file not found: {path}")
+    def _toggle_parameters_visibility(self) -> None:
+        if self.params_group is None or self.params_toggle_button is None:
             return
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                prefs = json.load(handle)
-            if "tr_duration" in prefs:
-                self.tr_duration_spin.setValue(float(prefs["tr_duration"]))
-            if "time_offset" in prefs:
-                self.time_offset_spin.setValue(float(prefs["time_offset"]))
-            self.preferences_path = path
-            if self.processed_frame is not None:
-                self._refresh_plot()
-        except Exception as exc:
-            self._show_error(f"Could not load preferences:\n{exc}")
-
-    def _save_preferences(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save Preferences", self.preferences_path or os.path.expanduser("~"), "JSON Files (*.json)")
-        if not path:
-            return
-        prefs = {
-            "tr_duration": self.tr_duration_spin.value(),
-            "time_offset": self.time_offset_spin.value(),
-        }
-        try:
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(prefs, handle, indent=2)
-            self.preferences_path = path
-        except Exception as exc:
-            self._show_error(f"Could not save preferences:\n{exc}")
+        visible = self.params_toggle_button.isChecked()
+        self.params_group.setVisible(visible)
+        self.params_toggle_button.setText("Hide Parameters" if visible else "Parameters")
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)

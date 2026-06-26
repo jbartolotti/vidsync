@@ -17,7 +17,7 @@ dependencies = [
   "pandas",
   "pyqtgraph",
   "PyQt5",
-  "python-vlc",
+  "ffpyplayer",
   "opencv-python"
 ]
 
